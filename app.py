@@ -1,190 +1,156 @@
 """
-Shiny for Python app that calls Connect's GET /v1/content/{guid} endpoint
-and renders the raw JSON response. All field-level assertions live in the
-calling pytest test, not here.
+Shiny for Python app that calls the Connect API for the running content
+itself and dumps two responses to the page:
 
-The app uses `posit.connect.Client()`, which authenticates using whatever
-the deployed environment provides:
-  * a visitor session token forwarded by Connect when the viewer is signed
-    in (preferred — no API key needed), or
-  * CONNECT_SERVER / CONNECT_API_KEY env vars (used when running locally).
+  * `<pre id="content-json">`     -- GET /v1/content/{this content's guid}
+  * `<pre id="associations-json">` -- the SNOWFLAKE OAuth association on
+                                      that content (or {} if none)
 
-The GUID is read from:
-  1. ?content_id=<guid> (or ?guid=<guid>) on the app URL  -- primary
-  2. document.referrer  -- catches the PCC dashboard iframe case
-  3. A text input in the UI  -- manual fallback
+This app verifies the fix in posit-hosted/vivid-blender#1840 which added
+`content_url` to the content payload and `app_guid` to OAuth associations.
+
+The app does no assertions — all field checks live in the calling pytest
+test (tests/integration/test_content_api.py).
+
+Deployment notes (manual publish):
+  * Attach a SNOWFLAKE OAuth integration to this content before publishing
+    so `associations.find_by(integration_type=SNOWFLAKE)` returns a record.
+  * No env vars or secrets needed. The SDK's default Client() picks up the
+    in-content credentials Connect provides automatically.
 """
 
 import json
-import os
-import re
-from urllib.parse import parse_qs
+from datetime import date, datetime
 
 from posit import connect
+from posit.connect import oauth as oauth_module  # for OAuthIntegrationType
 from shiny import App, Inputs, Outputs, Session, reactive, render, ui
 
 
-GUID_RE = re.compile(
-    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
-    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+SNOWFLAKE_TYPE = getattr(
+    getattr(oauth_module, "types", oauth_module),
+    "OAuthIntegrationType",
+    None,
 )
 
 
-def extract_guid(text):
-    if not text:
-        return None
-    match = GUID_RE.search(text)
-    return match.group(0) if match else None
+def _coerce(value):
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    return value
 
 
-def to_dict(content):
+def to_dict(obj):
+    """Best-effort conversion of a posit-sdk record (dict-like) to a plain dict."""
+    if obj is None:
+        return {}
     try:
-        return dict(content)
+        return {k: _coerce(v) for k, v in dict(obj).items()}
     except Exception:
-        return {"_repr": repr(content)}
+        return {"_repr": repr(obj)}
 
 
-def make_client():
-    """
-    Try visitor-token auth first (works when the viewer is signed in to
-    Connect and the platform forwards their session token to the app). Fall
-    back to CONNECT_SERVER/CONNECT_API_KEY env vars, then to the SDK's
-    default constructor.
-    """
-    server_url = os.environ.get("CONNECT_SERVER")
-    api_key = os.environ.get("CONNECT_API_KEY")
-    if server_url and api_key:
-        return connect.Client(url=server_url, api_key=api_key)
-    return connect.Client()
+def fetch_content_and_association():
+    client = connect.Client()
+    current_content = client.content.get()  # self
+    content_payload = to_dict(current_content)
 
+    association_payload = {}
+    association_error = None
+    try:
+        snowflake_value = (
+            SNOWFLAKE_TYPE.SNOWFLAKE
+            if SNOWFLAKE_TYPE is not None and hasattr(SNOWFLAKE_TYPE, "SNOWFLAKE")
+            else "snowflake"
+        )
+        sf_assoc = current_content.oauth.associations.find_by(
+            integration_type=snowflake_value
+        )
+        association_payload = to_dict(sf_assoc)
+    except Exception as exc:  # noqa: BLE001
+        association_error = f"{type(exc).__name__}: {exc}"
 
-# Tiny JS shim: surface document.referrer to the server so we can pull a
-# GUID out of the parent dashboard URL when the app is iframed.
-REFERRER_SHIM = ui.tags.script(
-    """
-    document.addEventListener('DOMContentLoaded', function () {
-        function send() {
-            if (window.Shiny && Shiny.setInputValue) {
-                Shiny.setInputValue('referrer', document.referrer || '',
-                                    {priority: 'event'});
-            } else {
-                setTimeout(send, 100);
-            }
-        }
-        send();
-    });
-    """
-)
+    return content_payload, association_payload, association_error
 
 
 app_ui = ui.page_fluid(
     ui.tags.style(
         """
         body { font-family: -apple-system, BlinkMacSystemFont, sans-serif;
-               max-width: 960px; margin: 24px auto; padding: 0 16px; }
+               max-width: 980px; margin: 24px auto; padding: 0 16px; }
+        h3 { margin-top: 28px; }
         pre { background: #f6f8fa; padding: 12px; border-radius: 4px;
-              max-height: 600px; overflow: auto; font-size: 0.85em; }
-        .status { padding: 8px 12px; border-radius: 4px; margin: 12px 0;
-                  font-family: monospace; }
-        .status.ok    { background: #d4edda; color: #155724; }
-        .status.error { background: #f8d7da; color: #721c24; }
-        .status.info  { background: #d1ecf1; color: #0c5460; }
-        .input-row { display: flex; gap: 8px; align-items: stretch;
-                     margin: 12px 0; }
-        .input-row .form-group { flex: 1; margin: 0; }
+              max-height: 480px; overflow: auto; font-size: 0.85em;
+              white-space: pre-wrap; word-break: break-all; }
+        .err { background: #f8d7da; color: #721c24; padding: 8px 12px;
+               border-radius: 4px; font-family: monospace; margin: 8px 0; }
         """
     ),
-    REFERRER_SHIM,
-    ui.h2("Connect API content verifier"),
-    ui.p("Calls ", ui.tags.code("GET /v1/content/{guid}"), " and displays the JSON response."),
-    ui.div(
-        ui.input_text(
-            "guid_input",
-            None,
-            placeholder="Paste a content GUID, or a full URL containing one",
-            width="100%",
-        ),
-        ui.input_action_button("verify", "Fetch", class_="btn-primary"),
-        class_="input-row",
+    ui.h2("Connect API content + OAuth association response"),
+    ui.p(
+        "Verifies posit-hosted/vivid-blender#1840: ",
+        ui.tags.code("content_url"),
+        " on the content payload and ",
+        ui.tags.code("app_guid"),
+        " on the SNOWFLAKE OAuth association.",
     ),
-    ui.output_ui("status_line"),
-    # The test reads this element. Keep the id stable.
-    ui.tags.pre(ui.output_text("response_json"), id="response-json"),
+    ui.h3("Content (client.content.get())"),
+    ui.tags.pre(ui.output_text("content_json"), id="content-json"),
+    ui.h3("Snowflake OAuth association (find_by integration_type=SNOWFLAKE)"),
+    ui.tags.pre(ui.output_text("associations_json"), id="associations-json"),
+    ui.output_ui("error_block"),
     ui.tags.pre(ui.output_text("error_text"), id="error-text"),
 )
 
 
 def server(input: Inputs, output: Outputs, session: Session):
     @reactive.calc
-    def auto_detected_guid():
+    def result():
         try:
-            search = input[".clientdata_url_search"]() or ""
-        except Exception:
-            search = ""
-        if search:
-            params = parse_qs(search.lstrip("?"))
-            for key in ("content_id", "guid"):
-                if key in params and params[key]:
-                    guid = extract_guid(params[key][0]) or params[key][0]
-                    if GUID_RE.fullmatch(guid):
-                        return guid
-            guid = extract_guid(search)
-            if guid:
-                return guid
-
-        try:
-            referrer = input["referrer"]() or ""
-        except Exception:
-            referrer = ""
-        return extract_guid(referrer)
-
-    @reactive.effect
-    def _autofill():
-        guid = auto_detected_guid()
-        if guid and not input.guid_input():
-            ui.update_text("guid_input", value=guid)
-
-    @reactive.calc
-    def requested_guid():
-        return extract_guid(input.guid_input())
-
-    @reactive.calc
-    @reactive.event(input.verify, auto_detected_guid, ignore_none=False)
-    def fetch_result():
-        guid = requested_guid()
-        if not guid:
-            return {"status": "no_guid"}
-        try:
-            client = make_client()
-            content = client.content.get(guid)
-            return {"status": "ok", "guid": guid, "body": to_dict(content)}
+            content, assoc, assoc_err = fetch_content_and_association()
+            return {
+                "status": "ok",
+                "content": content,
+                "association": assoc,
+                "association_error": assoc_err,
+            }
         except Exception as exc:  # noqa: BLE001
-            return {"status": "error", "guid": guid, "detail": str(exc)}
-
-    @render.ui
-    def status_line():
-        result = fetch_result()
-        if result["status"] == "no_guid":
-            return ui.div(
-                "Paste a GUID (or a URL containing one) and click Fetch.",
-                class_="status info",
-            )
-        if result["status"] == "error":
-            return ui.div(f"Fetch failed for {result['guid']}", class_="status error")
-        return ui.div(f"GET /v1/content/{result['guid']}", class_="status ok")
+            return {"status": "error", "detail": f"{type(exc).__name__}: {exc}"}
 
     @render.text
-    def response_json():
-        result = fetch_result()
-        if result.get("status") == "ok":
-            return json.dumps(result["body"], indent=2, default=str)
-        return ""
+    def content_json():
+        r = result()
+        if r["status"] != "ok":
+            return ""
+        return json.dumps(r["content"], indent=2, default=str)
+
+    @render.text
+    def associations_json():
+        r = result()
+        if r["status"] != "ok":
+            return ""
+        return json.dumps(r["association"], indent=2, default=str)
+
+    @render.ui
+    def error_block():
+        r = result()
+        msgs = []
+        if r["status"] == "error":
+            msgs.append(r["detail"])
+        elif r.get("association_error"):
+            msgs.append(f"association fetch error: {r['association_error']}")
+        if not msgs:
+            return ui.HTML("")
+        return ui.div(*[ui.div(m, class_="err") for m in msgs])
 
     @render.text
     def error_text():
-        result = fetch_result()
-        if result.get("status") == "error":
-            return result["detail"]
+        # Machine-readable single-string error for the test to scrape.
+        r = result()
+        if r["status"] == "error":
+            return r["detail"]
+        if r.get("association_error"):
+            return r["association_error"]
         return ""
 
 
