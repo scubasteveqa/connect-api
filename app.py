@@ -253,6 +253,10 @@ def server(input: Inputs, output: Outputs, session: Session):
         if guid:
             return guid, "document.referrer"
 
+        env_guid = extract_guid(os.environ.get("TARGET_CONTENT_ID", ""))
+        if env_guid:
+            return env_guid, "TARGET_CONTENT_ID env var"
+
         return None, ""
 
     @reactive.effect
