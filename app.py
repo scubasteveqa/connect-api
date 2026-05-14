@@ -76,7 +76,6 @@ app_ui = ui.page_fluid(
     ),
     ui.h2("Connect API content + OAuth association response"),
     ui.p(
-        "Verifies posit-hosted/vivid-blender#1840: ",
         ui.tags.code("content_url"),
         " on the content payload and ",
         ui.tags.code("app_guid"),
