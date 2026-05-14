@@ -2,10 +2,15 @@
 Shiny for Python app that calls the Connect API endpoint
 GET /v1/content/{guid} and verifies the response.
 
-The GUID is read from the URL query string, e.g.
-    https://<this-app>/?content_id=abc-123
+The GUID can come from (in priority order):
+  1. The text input in the UI (user pastes a GUID or a full content URL)
+  2. The browser URL: query string (?content_id=<guid>), pathname, or hash
+  3. document.referrer (catches iframe-embedded dashboards where the
+     parent URL carries the GUID, e.g.
+     https://staging.connect.posit.cloud/<org>/content/<guid>)
 """
 
+import json
 import os
 import re
 from datetime import datetime
@@ -16,8 +21,8 @@ from shiny import App, Inputs, Outputs, Session, reactive, render, ui
 
 
 GUID_RE = re.compile(
-    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
-    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 )
 
 REQUIRED_FIELDS = [
@@ -50,7 +55,14 @@ KNOWN_APP_MODES = {
 }
 
 
-def parse_iso8601(value: str) -> bool:
+def extract_guid(text: str | None) -> str | None:
+    if not text:
+        return None
+    match = GUID_RE.search(text)
+    return match.group(0) if match else None
+
+
+def parse_iso8601(value) -> bool:
     if not isinstance(value, str):
         return False
     try:
@@ -61,7 +73,6 @@ def parse_iso8601(value: str) -> bool:
 
 
 def to_dict(content) -> dict:
-    """posit-sdk Content behaves like a dict but make sure we materialize one."""
     try:
         return dict(content)
     except Exception:
@@ -85,7 +96,8 @@ def run_checks(requested_guid: str, body: dict) -> list[dict]:
     checks.append(
         {
             "name": "response.guid is a valid UUID",
-            "passed": isinstance(guid_value, str) and bool(GUID_RE.match(guid_value)),
+            "passed": isinstance(guid_value, str)
+            and bool(GUID_RE.fullmatch(guid_value)),
             "detail": repr(guid_value),
         }
     )
@@ -120,52 +132,144 @@ def run_checks(requested_guid: str, body: dict) -> list[dict]:
     return checks
 
 
+# Tiny JS shim: send document.referrer to the server as a Shiny input so
+# we can auto-detect the GUID from the dashboard URL when this app is
+# embedded in an iframe.
+REFERRER_SHIM = ui.tags.script(
+    """
+    document.addEventListener('DOMContentLoaded', function () {
+        function send() {
+            if (window.Shiny && Shiny.setInputValue) {
+                Shiny.setInputValue('referrer', document.referrer || '',
+                                    {priority: 'event'});
+            } else {
+                setTimeout(send, 100);
+            }
+        }
+        send();
+    });
+    """
+)
+
+
 app_ui = ui.page_fluid(
     ui.tags.style(
         """
-        body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; }
+        body { font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+               max-width: 960px; margin: 24px auto; padding: 0 16px; }
         .summary-pass { background: #d4edda; color: #155724; padding: 12px;
                         border-radius: 4px; font-weight: 600; }
         .summary-fail { background: #f8d7da; color: #721c24; padding: 12px;
                         border-radius: 4px; font-weight: 600; }
         .summary-info { background: #d1ecf1; color: #0c5460; padding: 12px;
                         border-radius: 4px; font-weight: 600; }
+        .source-note { color: #555; font-size: 0.9em; margin-top: 4px; }
         table.checks { width: 100%; border-collapse: collapse; margin-top: 12px; }
         table.checks th, table.checks td { padding: 8px 12px; text-align: left;
-                                           border-bottom: 1px solid #eee; }
-        table.checks tr.pass td:first-child::before { content: "✓ "; color: #28a745; }
-        table.checks tr.fail td:first-child::before { content: "✗ "; color: #dc3545; }
+                                           border-bottom: 1px solid #eee;
+                                           vertical-align: top; }
+        table.checks tr.pass td:first-child::before { content: "PASS  ";
+                                                      color: #28a745;
+                                                      font-weight: 700; }
+        table.checks tr.fail td:first-child::before { content: "FAIL  ";
+                                                      color: #dc3545;
+                                                      font-weight: 700; }
         pre.raw { background: #f6f8fa; padding: 12px; border-radius: 4px;
-                  max-height: 400px; overflow: auto; }
+                  max-height: 400px; overflow: auto; font-size: 0.85em; }
+        .input-row { display: flex; gap: 8px; align-items: stretch;
+                     margin: 12px 0; }
+        .input-row .form-group { flex: 1; margin: 0; }
         """
     ),
+    REFERRER_SHIM,
     ui.h2("Connect API content verifier"),
     ui.p(
         "Calls ",
         ui.tags.code("GET /v1/content/{guid}"),
-        " on the configured Connect server and checks the response shape.",
+        " on the configured Connect server and verifies the response.",
     ),
-    ui.output_ui("guid_banner"),
+    ui.div(
+        ui.input_text(
+            "guid_input",
+            None,
+            placeholder="Paste a content GUID, or a full URL containing one",
+            width="100%",
+        ),
+        ui.input_action_button("verify", "Verify", class_="btn-primary"),
+        class_="input-row",
+    ),
+    ui.output_ui("source_note"),
     ui.output_ui("summary"),
     ui.output_ui("checks_table"),
-    ui.h4("Raw response"),
-    ui.output_ui("raw_response"),
+    ui.output_ui("raw_response_section"),
 )
 
 
 def server(input: Inputs, output: Outputs, session: Session):
-    @reactive.calc
-    def requested_guid() -> str | None:
-        search = input[".clientdata_url_search"]()
-        if not search:
-            return None
-        params = parse_qs(search.lstrip("?"))
-        for key in ("content_id", "guid"):
-            if key in params and params[key]:
-                return params[key][0]
-        return None
+    detected_source: reactive.Value[str] = reactive.Value("")
 
     @reactive.calc
+    def auto_detected_guid() -> tuple[str | None, str]:
+        """Best-effort GUID extraction from the browser URL/referrer.
+
+        Returns (guid, source-label).
+        """
+        try:
+            search = input[".clientdata_url_search"]()
+        except Exception:
+            search = ""
+        if search:
+            params = parse_qs(search.lstrip("?"))
+            for key in ("content_id", "guid"):
+                if key in params and params[key]:
+                    guid = extract_guid(params[key][0]) or params[key][0]
+                    if GUID_RE.fullmatch(guid):
+                        return guid, f"URL query string ({key})"
+            guid = extract_guid(search)
+            if guid:
+                return guid, "URL query string"
+
+        try:
+            pathname = input[".clientdata_url_pathname"]()
+        except Exception:
+            pathname = ""
+        guid = extract_guid(pathname)
+        if guid:
+            return guid, "URL path"
+
+        try:
+            url_hash = input[".clientdata_url_hash"]()
+        except Exception:
+            url_hash = ""
+        guid = extract_guid(url_hash)
+        if guid:
+            return guid, "URL hash"
+
+        try:
+            referrer = input["referrer"]()
+        except Exception:
+            referrer = ""
+        guid = extract_guid(referrer)
+        if guid:
+            return guid, "document.referrer"
+
+        return None, ""
+
+    @reactive.effect
+    def _autofill():
+        # Populate the input box once we've detected something.
+        guid, source = auto_detected_guid()
+        if guid and not input.guid_input():
+            ui.update_text("guid_input", value=guid)
+            detected_source.set(source)
+
+    @reactive.calc
+    def requested_guid() -> str | None:
+        raw = input.guid_input()
+        return extract_guid(raw)
+
+    @reactive.calc
+    @reactive.event(input.verify, auto_detected_guid, ignore_none=False)
     def fetch_result():
         guid = requested_guid()
         if not guid:
@@ -176,7 +280,7 @@ def server(input: Inputs, output: Outputs, session: Session):
         if not server_url or not api_key:
             return {
                 "status": "no_creds",
-                "detail": "CONNECT_SERVER and CONNECT_API_KEY must be set",
+                "detail": "CONNECT_SERVER and CONNECT_API_KEY must be set in the app environment",
             }
 
         try:
@@ -188,16 +292,19 @@ def server(input: Inputs, output: Outputs, session: Session):
             return {"status": "error", "guid": guid, "detail": str(exc)}
 
     @render.ui
-    def guid_banner():
+    def source_note():
         guid = requested_guid()
         if not guid:
             return ui.div(
-                "No GUID supplied. Append ",
-                ui.tags.code("?content_id=<guid>"),
-                " to the URL.",
+                "Paste a GUID above (or a full URL — the GUID will be extracted) "
+                "and click Verify.",
                 class_="summary-info",
             )
-        return ui.div(f"Verifying content GUID: {guid}", class_="summary-info")
+        src = detected_source.get()
+        note = f"Verifying content GUID: {guid}"
+        if src:
+            note += f"  (auto-detected from {src})"
+        return ui.div(note, class_="summary-info")
 
     @render.ui
     def summary():
@@ -225,7 +332,7 @@ def server(input: Inputs, output: Outputs, session: Session):
     @render.ui
     def checks_table():
         result = fetch_result()
-        if result["status"] != "ok":
+        if result.get("status") != "ok":
             return ui.HTML("")
         checks = run_checks(result["guid"], result["body"])
         rows = [
@@ -243,14 +350,15 @@ def server(input: Inputs, output: Outputs, session: Session):
         )
 
     @render.ui
-    def raw_response():
+    def raw_response_section():
         result = fetch_result()
-        if result["status"] != "ok":
+        if result.get("status") != "ok":
             return ui.HTML("")
-        import json
-
-        return ui.tags.pre(
-            json.dumps(result["body"], indent=2, default=str), class_="raw"
+        return ui.div(
+            ui.h4("Raw response"),
+            ui.tags.pre(
+                json.dumps(result["body"], indent=2, default=str), class_="raw"
+            ),
         )
 
 
