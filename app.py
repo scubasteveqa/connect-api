@@ -5,18 +5,6 @@ itself and dumps two responses to the page:
   * `<pre id="content-json">`     -- GET /v1/content/{this content's guid}
   * `<pre id="associations-json">` -- the SNOWFLAKE OAuth association on
                                       that content (or {} if none)
-
-This app verifies the fix in posit-hosted/vivid-blender#1840 which added
-`content_url` to the content payload and `app_guid` to OAuth associations.
-
-The app does no assertions — all field checks live in the calling pytest
-test (tests/integration/test_content_api.py).
-
-Deployment notes (manual publish):
-  * Attach a SNOWFLAKE OAuth integration to this content before publishing
-    so `associations.find_by(integration_type=SNOWFLAKE)` returns a record.
-  * No env vars or secrets needed. The SDK's default Client() picks up the
-    in-content credentials Connect provides automatically.
 """
 
 import json
